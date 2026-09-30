@@ -1,0 +1,3 @@
+pyrgb devices
+
+@pause

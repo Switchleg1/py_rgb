@@ -1,0 +1,74 @@
+# py_rgb configuration - edit freely, restart to apply
+
+[general]
+backend = "auto"
+fps = 45
+brightness = 1.0
+effect = "cpu"
+devices = []
+autostart = true
+
+[daemon]
+host = "127.0.0.1"
+port = 6743
+token = ""
+watch_config = true
+clear_on_exit = false
+
+[gui]
+tray = true
+start_minimized = false
+close_to_tray = true
+
+[msi]
+brightness_level = 5
+save_to_flash = false
+max_hz = 25.0
+zones = []
+
+[openrgb]
+host = "127.0.0.1"
+port = 6742
+client_name = "py_rgb"
+force_direct_mode = true
+
+[effects.static]
+color = "#00aaff"
+
+[effects.breathing]
+color = "#00aaff"
+speed = 0.5
+min_brightness = 0.05
+
+[effects.rainbow]
+speed = 0.2
+spread = 1.0
+saturation = 1.0
+
+[effects.cpu]
+cold = "#00ff66"
+warm = "#ffcc00"
+hot = "#ff1000"
+smoothing = 0.4
+pulse = false
+
+[effects.audio]
+color = "#00ff9d"
+peak_color = "#ff0055"
+gain = 1.0
+smoothing = 0.35
+floor = 0.02
+
+[effects.strobe]
+color = "#ffffff"
+speed = 6.0
+duty = 0.35
+
+[effects.random]
+speed = 0.6
+per_led = false
+
+[audio]
+device = ""
+samplerate = 48000
+blocksize = 512

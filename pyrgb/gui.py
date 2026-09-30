@@ -1,0 +1,612 @@
+"""PyQt6 interface for py_rgb.
+
+The window is a *client*: when the daemon/service is running it edits
+``config.toml`` and sends it commands; otherwise it drives the hardware itself.
+It can live in the taskbar tray when ``[gui] tray = true``.
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import Any
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPalette, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QStatusBar,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .backends import BackendError
+from .color import BLACK, RGB
+from .config import config_path, load_config
+from .controller import Controller, LocalController, RemoteController, make_controller
+from .effects import REGISTRY, create_effect, effect_names
+
+
+def make_color_icon(color: RGB, size: int = 32) -> QIcon:
+    """Tray icon that mirrors the current LED colour."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color.r, color.g, color.b))
+    painter.setPen(QColor(20, 20, 20))
+    painter.drawEllipse(2, 2, size - 4, size - 4)
+    painter.end()
+    return QIcon(pixmap)
+
+
+class ColorSwatch(QWidget):
+    """Click-to-pick colour button with a live preview."""
+
+    changed = pyqtSignal(str)
+
+    def __init__(self, color: str = "#00aaff", clickable: bool = True) -> None:
+        super().__init__()
+        self._color = RGB.parse(color)
+        self._clickable = clickable
+        self.setMinimumSize(48, 26)
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor
+        )
+
+    def color(self) -> RGB:
+        return self._color
+
+    def set_color(self, color: RGB | str) -> None:
+        self._color = RGB.parse(color)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802, ANN001
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(self._color.r, self._color.g, self._color.b))
+        painter.setPen(QColor(70, 70, 70))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 5, 5)
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802, ANN001
+        if not self._clickable:
+            return
+        picked = QColorDialog.getColor(
+            QColor(self._color.r, self._color.g, self._color.b), self, "Pick a color"
+        )
+        if picked.isValid():
+            self.set_color(RGB(picked.red(), picked.green(), picked.blue()))
+            self.changed.emit(self._color.to_hex())
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, cfg: dict[str, Any], backend_name: str | None = None) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.backend_name = backend_name
+        self.setWindowTitle("py_rgb")
+        self.resize(580, 680)
+
+        self.controller: Controller = make_controller(cfg, backend_name)
+        self._option_widgets: dict[str, QWidget] = {}
+        self._updating = False
+        self._last_color = BLACK
+
+        self._build_ui()
+        self._build_tray()
+        self._load_from_state()
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(400)
+
+        if isinstance(self.controller, LocalController) and cfg.get("general", {}).get(
+            "autostart", True
+        ):
+            self.controller.resume()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        self.mode_label = QLabel()
+        self.mode_label.setWordWrap(True)
+        self.mode_label.setStyleSheet("color: palette(mid);")
+        root.addWidget(self.mode_label)
+
+        preview_box = QGroupBox("Live preview")
+        pl = QHBoxLayout(preview_box)
+        self.preview = ColorSwatch("#000000", clickable=False)
+        self.preview.setMinimumHeight(52)
+        self.preview_label = QLabel("#000000")
+        self.preview_label.setMinimumWidth(80)
+        pl.addWidget(self.preview, 1)
+        pl.addWidget(self.preview_label)
+        root.addWidget(preview_box)
+
+        effect_box = QGroupBox("Effect")
+        ev = QVBoxLayout(effect_box)
+        row = QHBoxLayout()
+        self.effect_combo = QComboBox()
+        for name in effect_names():
+            self.effect_combo.addItem(name, name)
+        self.effect_combo.currentIndexChanged.connect(self._on_effect_changed)
+        row.addWidget(QLabel("Effect:"))
+        row.addWidget(self.effect_combo, 1)
+        ev.addLayout(row)
+
+        self.effect_help = QLabel("")
+        self.effect_help.setWordWrap(True)
+        self.effect_help.setStyleSheet("color: palette(mid);")
+        ev.addWidget(self.effect_help)
+
+        self.options_widget = QWidget()
+        self.options_form = QFormLayout(self.options_widget)
+        self.options_form.setContentsMargins(0, 6, 0, 0)
+        ev.addWidget(self.options_widget)
+        root.addWidget(effect_box)
+
+        global_box = QGroupBox("Global")
+        gf = QFormLayout(global_box)
+        self.brightness = QSlider(Qt.Orientation.Horizontal)
+        self.brightness.setRange(0, 100)
+        self.brightness.setValue(100)
+        self.brightness.valueChanged.connect(self._on_brightness)
+        self.brightness_label = QLabel("100%")
+        brow = QHBoxLayout()
+        brow.addWidget(self.brightness, 1)
+        brow.addWidget(self.brightness_label)
+        bw = QWidget()
+        bw.setLayout(brow)
+        gf.addRow("Brightness", bw)
+
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 144)
+        self.fps_spin.setValue(30)
+        self.fps_spin.valueChanged.connect(self._on_fps)
+        gf.addRow("Frame rate", self.fps_spin)
+        root.addWidget(global_box)
+
+        startup_box = QGroupBox("Startup")
+        sf = QFormLayout(startup_box)
+        self.autostart_check = QCheckBox("Start py_rgb with Windows")
+        self.autostart_check.setToolTip(
+            "Adds HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\py_rgb.\n"
+            "Off by default; no administrator rights required."
+        )
+        self.autostart_check.toggled.connect(self._on_autostart_toggled)
+        sf.addRow(self.autostart_check)
+
+        self.tray_check = QCheckBox("Minimise to tray instead of quitting")
+        self.tray_check.toggled.connect(
+            lambda checked: self.cfg.setdefault("gui", {}).__setitem__("close_to_tray", checked)
+        )
+        sf.addRow(self.tray_check)
+
+        self.minimized_check = QCheckBox("Start minimised to tray")
+        self.minimized_check.toggled.connect(
+            lambda checked: self.cfg.setdefault("gui", {}).__setitem__(
+                "start_minimized", checked
+            )
+        )
+        sf.addRow(self.minimized_check)
+
+        self.autostart_hint = QLabel("")
+        self.autostart_hint.setWordWrap(True)
+        self.autostart_hint.setStyleSheet("color: palette(mid);")
+        sf.addRow(self.autostart_hint)
+        root.addWidget(startup_box)
+
+        device_box = QGroupBox("Devices")
+        dv = QVBoxLayout(device_box)
+        self.device_list = QListWidget()
+        self.device_list.setMaximumHeight(110)
+        self.device_list.itemChanged.connect(self._on_devices_changed)
+        dv.addWidget(self.device_list)
+        root.addWidget(device_box)
+
+        buttons = QHBoxLayout()
+        self.start_btn = QPushButton("Start")
+        self.start_btn.clicked.connect(self._toggle)
+        self.off_btn = QPushButton("All off")
+        self.off_btn.clicked.connect(self._all_off)
+        self.save_btn = QPushButton("Save && apply")
+        self.save_btn.clicked.connect(self._save_config)
+        self.reload_btn = QPushButton("Reload config")
+        self.reload_btn.clicked.connect(self._reload_config)
+        for b in (self.start_btn, self.off_btn, self.save_btn, self.reload_btn):
+            buttons.addWidget(b)
+        root.addLayout(buttons)
+
+        self.setCentralWidget(central)
+        self.setStatusBar(QStatusBar())
+        self._populate_devices()
+
+    def _build_tray(self) -> None:
+        gui_cfg = self.cfg.get("gui", {})
+        self.tray: QSystemTrayIcon | None = None
+        if not gui_cfg.get("tray", True) or not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.tray = QSystemTrayIcon(make_color_icon(BLACK), self)
+        self.tray.setToolTip("py_rgb")
+        menu = QMenu()
+
+        self.act_show = QAction("Show window", self)
+        self.act_show.triggered.connect(self._show_window)
+        menu.addAction(self.act_show)
+        menu.addSeparator()
+
+        effects_menu = menu.addMenu("Effect")
+        for name in effect_names():
+            action = QAction(name, self)
+            action.triggered.connect(lambda _checked=False, n=name: self._tray_effect(n))
+            effects_menu.addAction(action)
+
+        self.act_toggle = QAction("Pause", self)
+        self.act_toggle.triggered.connect(self._toggle)
+        menu.addAction(self.act_toggle)
+
+        act_off = QAction("All off", self)
+        act_off.triggered.connect(self._all_off)
+        menu.addAction(act_off)
+        menu.addSeparator()
+
+        act_quit = QAction("Quit py_rgb", self)
+        act_quit.triggered.connect(self._quit)
+        menu.addAction(act_quit)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+    # ------------------------------------------------------------------
+    # state sync
+    # ------------------------------------------------------------------
+    def _populate_devices(self) -> None:
+        self._updating = True
+        self.device_list.clear()
+        devices = self.controller.devices()
+        selected = self.controller.status().get("devices") or []
+        for dev in devices:
+            item = QListWidgetItem(
+                f"[{dev['index']}] {dev['name']} - {dev['leds']} LEDs ({dev['kind']})"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, dev["index"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            checked = (not selected) or dev["index"] in selected
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            self.device_list.addItem(item)
+        if not devices:
+            self.device_list.addItem("no devices detected")
+        self._updating = False
+
+    def _load_from_state(self) -> None:
+        status = self.controller.status()
+        self._updating = True
+        name = status.get("effect") or self.cfg.get("general", {}).get("effect", "breathing")
+        idx = self.effect_combo.findData(name)
+        self.effect_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.brightness.setValue(int(float(status.get("brightness", 1.0)) * 100))
+        self.brightness_label.setText(f"{self.brightness.value()}%")
+        self.fps_spin.setValue(int(status.get("fps", 30) or 30))
+        gui_cfg = self.cfg.get("gui", {})
+        self.tray_check.setChecked(bool(gui_cfg.get("close_to_tray", True)))
+        self.minimized_check.setChecked(bool(gui_cfg.get("start_minimized", False)))
+        self._sync_autostart_checkbox()
+        self._updating = False
+        self._rebuild_options(status.get("params") or {})
+        self._update_mode_label()
+
+    def _update_mode_label(self) -> None:
+        if isinstance(self.controller, RemoteController):
+            self.mode_label.setText(
+                "Connected to the py_rgb daemon - changes are sent to the service and "
+                "saved to config.toml."
+            )
+        else:
+            self.mode_label.setText(
+                "Running locally (no daemon detected) - this window owns the hardware."
+            )
+
+    def _rebuild_options(self, params: dict[str, Any] | None = None) -> None:
+        while self.options_form.rowCount():
+            self.options_form.removeRow(0)
+        self._option_widgets.clear()
+
+        name = self.effect_combo.currentData() or "breathing"
+        cls = REGISTRY[name]
+        params = params or dict(create_effect(name, self.cfg).params)
+        self.effect_help.setText(cls.description + self._source_hint(name))
+
+        self._updating = True
+        for key, (kind, default, lo, hi) in cls.options.items():
+            value = params.get(key, default)
+            if kind == "color":
+                w: QWidget = ColorSwatch(str(value))
+                w.changed.connect(lambda hexval, k=key: self._set_param(k, hexval))
+            elif kind == "bool":
+                w = QCheckBox()
+                w.setChecked(_as_bool(value))
+                w.toggled.connect(lambda checked, k=key: self._set_param(k, checked))
+            elif kind == "int":
+                w = QSpinBox()
+                w.setRange(int(lo if lo is not None else 0), int(hi if hi is not None else 1000))
+                w.setValue(int(value))
+                w.valueChanged.connect(lambda v, k=key: self._set_param(k, v))
+            else:
+                w = QDoubleSpinBox()
+                w.setDecimals(2)
+                w.setSingleStep(0.05)
+                w.setRange(
+                    float(lo if lo is not None else 0.0), float(hi if hi is not None else 100.0)
+                )
+                w.setValue(float(value))
+                w.valueChanged.connect(lambda v, k=key: self._set_param(k, v))
+            self._option_widgets[key] = w
+            self.options_form.addRow(key.replace("_", " ").title(), w)
+        self._updating = False
+
+    @staticmethod
+    def _source_hint(name: str) -> str:
+        if name == "cpu":
+            return "  (live CPU load via psutil)"
+        if name == "audio":
+            return "  (captures speaker output; not available to a session-0 service)"
+        return ""
+
+    # ------------------------------------------------------------------
+    # actions
+    # ------------------------------------------------------------------
+    def _set_param(self, key: str, value: Any) -> None:
+        if self._updating:
+            return
+        self.controller.set_param(key, value)
+        effects = self.cfg.setdefault("effects", {})
+        effects.setdefault(self.effect_combo.currentData(), {})[key] = value
+
+    def _on_effect_changed(self) -> None:
+        if self._updating:
+            return
+        name = self.effect_combo.currentData()
+        if not name:
+            return
+        params = dict(self.cfg.get("effects", {}).get(name, {}) or {})
+        self.controller.set_effect(name, params)
+        self.cfg.setdefault("general", {})["effect"] = name
+        self._rebuild_options(dict(create_effect(name, self.cfg).params))
+
+    def _on_brightness(self, value: int) -> None:
+        self.brightness_label.setText(f"{value}%")
+        if self._updating:
+            return
+        self.controller.set_brightness(value / 100.0)
+        self.cfg.setdefault("general", {})["brightness"] = round(value / 100.0, 3)
+
+    def _on_fps(self, value: int) -> None:
+        if self._updating:
+            return
+        self.controller.set_fps(value)
+        self.cfg.setdefault("general", {})["fps"] = value
+
+    def _on_devices_changed(self) -> None:
+        if self._updating:
+            return
+        indices = []
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            idx = item.data(Qt.ItemDataRole.UserRole)
+            if idx is not None and item.checkState() == Qt.CheckState.Checked:
+                indices.append(int(idx))
+        self.controller.set_devices(indices)
+        self.cfg.setdefault("general", {})["devices"] = indices
+
+    # -- windows autostart ---------------------------------------------
+    def _sync_autostart_checkbox(self) -> None:
+        from . import service as svc
+
+        was = self._updating
+        self._updating = True
+        try:
+            installed = svc.startup_installed()
+            self.autostart_check.setChecked(installed)
+            self.autostart_hint.setText(
+                f"Runs: {' '.join(svc.daemon_command())}" if installed else "Not registered."
+            )
+        finally:
+            self._updating = was
+
+    def _on_autostart_toggled(self, checked: bool) -> None:
+        if self._updating:
+            return
+        from . import service as svc
+
+        ok, message = svc.startup_install() if checked else svc.startup_uninstall()
+        if not ok:
+            QMessageBox.warning(self, "py_rgb", f"Could not change the startup entry:\n{message}")
+        else:
+            self.statusBar().showMessage(message, 5000)
+        self._sync_autostart_checkbox()
+
+    def _toggle(self) -> None:
+        running = bool(self.controller.status().get("running"))
+        if running:
+            self.controller.pause()
+        else:
+            self.controller.resume()
+
+    def _all_off(self) -> None:
+        try:
+            self.controller.all_off()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "py_rgb", str(exc))
+        self._apply_preview(BLACK)
+
+    def _save_config(self) -> None:
+        try:
+            path = self.controller.apply_config(self.cfg)
+            msg = f"saved {path}"
+            if isinstance(self.controller, RemoteController):
+                msg += " and told the daemon to reload"
+            self.statusBar().showMessage(msg, 4000)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "py_rgb", f"Could not save config:\n{exc}")
+
+    def _reload_config(self) -> None:
+        self.cfg = load_config()
+        if isinstance(self.controller, LocalController):
+            self.controller.cfg = self.cfg
+        self._load_from_state()
+        self.statusBar().showMessage(f"reloaded {config_path()}", 3000)
+
+    # -- tray ----------------------------------------------------------
+    def _tray_effect(self, name: str) -> None:
+        idx = self.effect_combo.findData(name)
+        if idx >= 0:
+            self.effect_combo.setCurrentIndex(idx)
+
+    def _tray_activated(self, reason) -> None:  # noqa: ANN001
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_window() if not self.isVisible() else self.hide()
+
+    def _show_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit(self) -> None:
+        self._force_quit = True
+        if self.tray is not None:
+            self.tray.hide()
+        self.close()
+        QApplication.quit()
+
+    # ------------------------------------------------------------------
+    # periodic refresh
+    # ------------------------------------------------------------------
+    def _refresh(self) -> None:
+        status = self.controller.status()
+
+        color = RGB.parse(status.get("color") or "#000000")
+        if color != self._last_color:
+            self._apply_preview(color)
+
+        running = bool(status.get("running"))
+        self.start_btn.setText("Pause" if running else "Start")
+        if self.tray is not None:
+            self.act_toggle.setText("Pause" if running else "Start")
+
+        parts = [f"backend: {self.controller.backend_name}"]
+        parts.append(f"{status.get('fps', 0)} fps" if running else "stopped")
+        effect = status.get("effect")
+        if effect == "cpu":
+            parts.append(f"cpu: {float(status.get('cpu', 0.0)) * 100:.0f}%")
+        elif effect == "audio":
+            mode = status.get("audio_mode", "none")
+            if mode and mode != "none":
+                parts.append(f"audio: {float(status.get('audio', 0.0)) * 100:.0f}%")
+            else:
+                parts.append("audio: unavailable")
+        if status.get("error"):
+            parts.append(f"error: {status['error']}")
+        if isinstance(self.controller, RemoteController) and not self.controller.connected:
+            parts = ["daemon connection lost - restart it or reopen this window"]
+        self.statusBar().showMessage("   |   ".join(parts))
+
+    def _apply_preview(self, color: RGB) -> None:
+        self._last_color = color
+        self.preview.set_color(color)
+        self.preview_label.setText(color.to_hex())
+        if self.tray is not None:
+            self.tray.setIcon(make_color_icon(color))
+            self.tray.setToolTip(f"py_rgb - {self._mode_word()} - {color.to_hex()}")
+
+    def _mode_word(self) -> str:
+        return "daemon" if isinstance(self.controller, RemoteController) else "local"
+
+    # ------------------------------------------------------------------
+    def closeEvent(self, event) -> None:  # noqa: N802, ANN001
+        close_to_tray = self.cfg.get("gui", {}).get("close_to_tray", True)
+        if getattr(self, "_force_quit", False) or self.tray is None or not close_to_tray:
+            self._timer.stop()
+            self.controller.close()
+            super().closeEvent(event)
+            return
+        event.ignore()
+        self.hide()
+        self.tray.showMessage(
+            "py_rgb",
+            "Still running in the tray. Use Quit py_rgb to exit.",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000,
+        )
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def run_gui(cfg: dict[str, Any], backend_name: str | None = None) -> int:
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("py_rgb")
+    _apply_dark_palette(app)
+
+    gui_cfg = cfg.get("gui", {})
+    tray_wanted = gui_cfg.get("tray", True) and QSystemTrayIcon.isSystemTrayAvailable()
+    app.setQuitOnLastWindowClosed(not tray_wanted)
+
+    try:
+        window = MainWindow(cfg, backend_name)
+    except BackendError as exc:
+        QMessageBox.critical(None, "py_rgb", str(exc))
+        return 2
+
+    if gui_cfg.get("start_minimized", False) and tray_wanted:
+        window.hide()
+    else:
+        window.show()
+    return app.exec()
+
+
+def _apply_dark_palette(app: QApplication) -> None:
+    palette = QPalette()
+    bg, base, text = QColor(32, 33, 36), QColor(24, 25, 28), QColor(225, 226, 230)
+    palette.setColor(QPalette.ColorRole.Window, bg)
+    palette.setColor(QPalette.ColorRole.WindowText, text)
+    palette.setColor(QPalette.ColorRole.Base, base)
+    palette.setColor(QPalette.ColorRole.AlternateBase, bg)
+    palette.setColor(QPalette.ColorRole.Text, text)
+    palette.setColor(QPalette.ColorRole.Button, QColor(45, 46, 50))
+    palette.setColor(QPalette.ColorRole.ButtonText, text)
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 150, 220))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    app.setPalette(palette)

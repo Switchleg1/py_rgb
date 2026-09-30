@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py_rgb"
+version = "0.1.0"
+description = "Motherboard / system RGB control with a Python CLI and a Qt6 interface"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openrgb-python>=0.3.0",
+    "psutil>=5.9",
+    "hidapi>=0.14",
+]
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.5"]
+audio = ["sounddevice>=0.5", "numpy>=1.24"]
+all = ["PyQt6>=6.5", "sounddevice>=0.5", "numpy>=1.24"]
+
+[project.scripts]
+pyrgb = "pyrgb.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pyrgb*"]
