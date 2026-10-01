@@ -277,6 +277,9 @@ class Daemon:
                 else []
             ),
             "cpu": round(engine.cpu.value, 3) if engine else 0.0,
+            "temp": round(engine.temp.value, 1) if engine else 0.0,
+            "temp_provider": engine.temp.provider if engine else "none",
+            "temp_available": bool(engine and engine.temp.available),
             "audio": round(engine.audio.level, 3) if engine else 0.0,
             "audio_mode": engine.audio.mode if engine else "none",
             "error": engine.error if engine else None,

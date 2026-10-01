@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from .color import BLACK, RGB, gradient
-from .sources import AudioSource, CPUSource
+from .sources import AudioSource, CPUSource, CPUTempSource
 
 
 @dataclass(slots=True)
@@ -22,6 +22,7 @@ class EffectContext:
     frame: int = 0
     cpu: CPUSource | None = None
     audio: AudioSource | None = None
+    temp: CPUTempSource | None = None
     brightness: float = 1.0
 
     @property
@@ -31,6 +32,14 @@ class EffectContext:
     @property
     def audio_level(self) -> float:
         return self.audio.level if self.audio is not None else 0.0
+
+    @property
+    def cpu_temp(self) -> float:
+        return self.temp.value if self.temp is not None else 0.0
+
+    @property
+    def temp_available(self) -> bool:
+        return bool(self.temp is not None and self.temp.available)
 
 
 class Effect:
@@ -129,11 +138,17 @@ class RainbowEffect(Effect):
 
 class CPUEffect(Effect):
     name = "cpu"
-    description = "Color follows CPU usage (cold -> warm -> hot)."
+    description = (
+        "Colour follows the CPU: temperature (min/mid/max thresholds) or load."
+    )
     options = {
+        "source": ("choice", "temp", ["temp", "load"], None),
         "cold": ("color", "#00ff66", None, None),
         "warm": ("color", "#ffcc00", None, None),
         "hot": ("color", "#ff1000", None, None),
+        "min_temp": ("float", 35.0, 0.0, 120.0),
+        "mid_temp": ("float", 60.0, 0.0, 120.0),
+        "max_temp": ("float", 85.0, 0.0, 120.0),
         "smoothing": ("float", 0.25, 0.0, 0.95),
         "pulse": ("bool", False, None, None),
     }
@@ -141,8 +156,30 @@ class CPUEffect(Effect):
     def reset(self) -> None:
         self._value = 0.0
 
+    def uses_temperature(self, ctx: EffectContext | None = None) -> bool:
+        """Temperature mode, unless no sensor is available (then fall back)."""
+        if str(self.params.get("source", "temp")).lower() != "temp":
+            return False
+        return ctx is None or ctx.temp_available
+
+    def _level(self, ctx: EffectContext) -> float:
+        """Map the chosen signal onto 0..1 across cold / warm / hot."""
+        if not self.uses_temperature(ctx):
+            return max(0.0, min(1.0, ctx.cpu_load))
+
+        temp = ctx.cpu_temp
+        lo, mid, hi = (self.num("min_temp"), self.num("mid_temp"), self.num("max_temp"))
+        mid = min(max(mid, lo + 0.1), hi - 0.1) if hi > lo + 0.2 else (lo + hi) / 2
+        if temp <= lo:
+            return 0.0
+        if temp >= hi:
+            return 1.0
+        if temp <= mid:
+            return 0.5 * (temp - lo) / max(0.1, mid - lo)
+        return 0.5 + 0.5 * (temp - mid) / max(0.1, hi - mid)
+
     def render(self, n: int, ctx: EffectContext) -> list[RGB]:
-        target = max(0.0, min(1.0, ctx.cpu_load))
+        target = max(0.0, min(1.0, self._level(ctx)))
         a = self.num("smoothing")
         self._value = self._value * a + target * (1.0 - a)
         col = gradient([self.color("cold"), self.color("warm"), self.color("hot")], self._value)
@@ -280,6 +317,10 @@ def needs_audio(effect: Effect) -> bool:
     return isinstance(effect, AudioEffect)
 
 
+def needs_temp(effect: Effect) -> bool:
+    return isinstance(effect, CPUEffect) and effect.uses_temperature()
+
+
 def _coerce(kind: str, value: Any) -> Any:
     if value is None:
         return None
@@ -293,6 +334,8 @@ def _coerce(kind: str, value: Any) -> Any:
         return bool(value)
     if kind == "color":
         return RGB.parse(value).to_hex()
+    if kind == "choice":
+        return str(value).strip().lower()
     return value
 
 

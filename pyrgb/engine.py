@@ -9,8 +9,8 @@ from typing import Any, Callable
 
 from .backends import RGBBackend
 from .color import RGB
-from .effects import Effect, EffectContext, create_effect, needs_audio, needs_cpu
-from .sources import AudioSource, CPUSource
+from .effects import Effect, EffectContext, create_effect, needs_audio, needs_cpu, needs_temp
+from .sources import AudioSource, CPUSource, CPUTempSource
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ class Engine:
         self._lock = threading.RLock()
 
         self.cpu = CPUSource()
+        self.temp = CPUTempSource()
         self.audio = AudioSource(
             device=_audio_device(cfg),
             samplerate=int(cfg.get("audio", {}).get("samplerate", 48000)),
@@ -104,6 +105,8 @@ class Engine:
         effect = self.effect
         if needs_cpu(effect):
             self.cpu.start()
+        if needs_temp(effect):
+            self.temp.start()
         if needs_audio(effect):
             self.audio.start()
 
@@ -122,6 +125,7 @@ class Engine:
         if thread is not None:
             thread.join(timeout=2.0)
         self.cpu.stop()
+        self.temp.stop()
         self.audio.stop()
         if clear:
             try:
@@ -134,7 +138,7 @@ class Engine:
         period = 1.0 / self.fps
         start = time.perf_counter()
         prev = start
-        ctx = EffectContext(cpu=self.cpu, audio=self.audio)
+        ctx = EffectContext(cpu=self.cpu, audio=self.audio, temp=self.temp)
         infos = {i.index: i for i in self.backend.devices()}
 
         while not self._stop.is_set():
@@ -180,7 +184,9 @@ class Engine:
     def apply_once(self, effect: Effect | None = None) -> list[RGB]:
         """Render and push a single frame (used by ``pyrgb set``)."""
         eff = effect or self.effect
-        ctx = EffectContext(cpu=self.cpu, audio=self.audio, brightness=self.brightness)
+        ctx = EffectContext(
+            cpu=self.cpu, audio=self.audio, temp=self.temp, brightness=self.brightness
+        )
         last: list[RGB] = []
         infos = {i.index: i for i in self.backend.devices()}
         for idx in self.targets:

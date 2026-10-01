@@ -2,9 +2,9 @@
 
 [general]
 backend = "auto"
-fps = 45
+fps = 30
 brightness = 1.0
-effect = "cpu"
+effect = "breathing"
 devices = []
 autostart = true
 
@@ -46,10 +46,14 @@ spread = 1.0
 saturation = 1.0
 
 [effects.cpu]
+source = "temp"
 cold = "#00ff66"
 warm = "#ffcc00"
 hot = "#ff1000"
-smoothing = 0.4
+min_temp = 35.0
+mid_temp = 60.0
+max_temp = 85.0
+smoothing = 0.25
 pulse = false
 
 [effects.audio]

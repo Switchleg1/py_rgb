@@ -46,18 +46,35 @@ def python_exe() -> str:
     return str(windowed if windowed.is_file() else exe)
 
 
-def daemon_command(cfg_path: Path | None = None) -> list[str]:
-    """Command line that launches the daemon, frozen or from source."""
+def _windowless_exe() -> str:
+    """The console-free executable to launch background/UI processes with."""
+    exe = Path(sys.executable)
+    for candidate in ("pyrgbw.exe", "pyrgb-daemon.exe"):
+        sibling = exe.with_name(candidate)
+        if sibling.is_file():
+            return str(sibling)
+    return str(exe)
+
+
+def _command(subcommand: str, cfg_path: Path | None = None) -> list[str]:
     path = cfg_path or config_path()
     if is_frozen():
-        exe = Path(sys.executable)
-        # prefer the windowless daemon build when it sits next to us
-        for candidate in ("pyrgb-daemon.exe", "pyrgbw.exe"):
-            sibling = exe.with_name(candidate)
-            if sibling.is_file():
-                return [str(sibling), "daemon", "--config", str(path)]
-        return [str(exe), "daemon", "--config", str(path)]
-    return [python_exe(), "-m", "pyrgb", "daemon", "--config", str(path)]
+        return [_windowless_exe(), subcommand, "--config", str(path)]
+    return [python_exe(), "-m", "pyrgb", subcommand, "--config", str(path)]
+
+
+def daemon_command(cfg_path: Path | None = None) -> list[str]:
+    """Command line that launches the headless daemon only."""
+    return _command("daemon", cfg_path)
+
+
+def tray_command(cfg_path: Path | None = None) -> list[str]:
+    """Command line that launches the daemon *and* the tray icon."""
+    return _command("tray", cfg_path)
+
+
+def startup_command(cfg_path: Path | None = None, with_tray: bool = False) -> list[str]:
+    return tray_command(cfg_path) if with_tray else daemon_command(cfg_path)
 
 
 def _run(args: list[str]) -> tuple[int, str]:
@@ -117,22 +134,46 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "py_rgb"
 
 
-def _run_command_string(cfg_path: Path | None = None) -> str:
-    cmd = daemon_command(cfg_path)
+def _quote(cmd: list[str]) -> str:
     return f'"{cmd[0]}" ' + " ".join(f'"{p}"' if " " in p else p for p in cmd[1:])
 
 
-def startup_install(cfg_path: Path | None = None) -> tuple[bool, str]:
+def _run_command_string(cfg_path: Path | None = None, with_tray: bool = False) -> str:
+    return _quote(startup_command(cfg_path, with_tray))
+
+
+def startup_install(cfg_path: Path | None = None, with_tray: bool = False) -> tuple[bool, str]:
     try:
         import winreg
 
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             winreg.SetValueEx(
-                key, RUN_VALUE, 0, winreg.REG_SZ, _run_command_string(cfg_path)
+                key, RUN_VALUE, 0, winreg.REG_SZ, _run_command_string(cfg_path, with_tray)
             )
-        return True, f"registered HKCU\\{RUN_KEY}\\{RUN_VALUE} (starts at logon, no admin needed)"
+        what = "daemon + tray icon" if with_tray else "daemon only"
+        return True, (
+            f"registered HKCU\\{RUN_KEY}\\{RUN_VALUE} "
+            f"({what}, starts at logon, no admin needed)"
+        )
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+
+def startup_entry() -> str | None:
+    """The currently registered logon command, if any."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, RUN_VALUE)
+        return str(value)
+    except Exception:
+        return None
+
+
+def startup_has_tray() -> bool:
+    entry = startup_entry()
+    return bool(entry and " tray" in entry)
 
 
 def startup_uninstall() -> tuple[bool, str]:
@@ -159,11 +200,18 @@ def startup_installed() -> bool:
         return False
 
 
-def daemon_spawn(cfg_path: Path | None = None) -> tuple[bool, str]:
-    """Start the daemon detached from this console."""
+def daemon_spawn(
+    cfg_path: Path | None = None, wait: float = 0.0, host: str = "127.0.0.1", port: int = 6743
+) -> tuple[bool, str]:
+    """Start the daemon detached from this console.
+
+    With ``wait`` > 0, block until the control channel answers (or time out).
+    """
+    import time
+
     from .ipc import is_running
 
-    if is_running():
+    if is_running(host, port):
         return True, "daemon already running"
     flags = 0
     if os.name == "nt":
@@ -178,6 +226,14 @@ def daemon_spawn(cfg_path: Path | None = None) -> tuple[bool, str]:
         )
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+    if wait > 0:
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if is_running(host, port):
+                return True, "daemon started"
+            time.sleep(0.2)
+        return False, f"daemon did not answer within {wait:.0f}s"
     return True, "daemon started"
 
 

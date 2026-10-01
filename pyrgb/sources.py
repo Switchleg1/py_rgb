@@ -64,6 +64,240 @@ class CPUSource:
             thread.join(timeout=1.0)
 
 
+class CPUTempSource:
+    """CPU temperature in degrees Celsius, from whatever provider works.
+
+    Windows exposes no usable CPU temperature API to unprivileged code, so this
+    tries, in order:
+
+    1. **MSI Afterburner** shared memory (``MAHMSharedMemory``) - no admin
+    2. **LibreHardwareMonitor / OpenHardwareMonitor** WMI sensors
+    3. ``psutil.sensors_temperatures()`` (Linux, some other platforms)
+    4. ACPI ``MSAcpi_ThermalZoneTemperature`` (usually needs admin, chipset only)
+    """
+
+    def __init__(self, interval: float = 1.0) -> None:
+        self.interval = interval
+        self._value = 0.0
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self.available = False
+        self.provider = "none"
+        self._reader: Any = None
+
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        for name, factory in (
+            ("MSI Afterburner", _afterburner_reader),
+            ("LibreHardwareMonitor", _lhm_reader),
+            ("psutil", _psutil_reader),
+            ("ACPI thermal zone", _acpi_reader),
+        ):
+            try:
+                reader = factory()
+            except Exception:  # pragma: no cover - provider specific
+                reader = None
+            if reader is None:
+                continue
+            try:
+                probe = reader()
+            except Exception:  # pragma: no cover
+                continue
+            if probe is not None and probe > 0:
+                self._reader = reader
+                self.provider = name
+                self.available = True
+                with self._lock:
+                    self._value = probe
+                break
+
+        if not self.available:
+            log.info(
+                "no CPU temperature provider found "
+                "(run MSI Afterburner or LibreHardwareMonitor to enable it)"
+            )
+            return
+
+        log.info("CPU temperature via %s", self.provider)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="pyrgb-temp", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                value = self._reader()
+            except Exception:  # pragma: no cover
+                value = None
+            if value is not None and value > 0:
+                with self._lock:
+                    self._value = float(value)
+            self._stop.wait(self.interval)
+
+    @property
+    def value(self) -> float:
+        with self._lock:
+            return self._value
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=1.5)
+
+
+# -- temperature providers -------------------------------------------------
+
+def _afterburner_reader() -> Any:
+    """Read the hottest CPU temperature from MSI Afterburner shared memory."""
+    import sys
+
+    if not sys.platform.startswith("win"):
+        return None
+
+    import ctypes
+    import ctypes.wintypes as wintypes
+    import struct
+
+    FILE_MAP_READ = 0x0004
+    NAME = "MAHMSharedMemory"
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenFileMappingW.restype = wintypes.HANDLE
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+
+    def read() -> float | None:
+        handle = kernel32.OpenFileMappingW(FILE_MAP_READ, False, NAME)
+        if not handle:
+            return None
+        address = kernel32.MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0)
+        try:
+            if not address:
+                return None
+            header = bytes((ctypes.c_char * 20).from_address(address))
+            sig, _ver, hdr_size, count, entry_size = struct.unpack("<5I", header)
+            if sig not in (0x4D41484D, 0x4D48414D) or not count or entry_size < 1304:
+                return None
+            blob = bytes((ctypes.c_char * (hdr_size + count * entry_size)).from_address(address))
+            best: float | None = None
+            for i in range(count):
+                off = hdr_size + i * entry_size
+                entry = blob[off : off + entry_size]
+                name = entry[0:260].split(b"\x00")[0].decode("latin1")
+                lowered = name.lower()
+                if "cpu" not in lowered or "temperature" not in lowered:
+                    continue
+                (value,) = struct.unpack("<f", entry[1300:1304])
+                if 0 < value < 150 and (best is None or value > best):
+                    best = float(value)
+            return best
+        finally:
+            if address:
+                kernel32.UnmapViewOfFile(ctypes.c_void_p(address))
+            kernel32.CloseHandle(handle)
+
+    return read if read() is not None else None
+
+
+def _lhm_reader() -> Any:
+    """LibreHardwareMonitor / OpenHardwareMonitor WMI sensors."""
+    import subprocess
+    import sys
+
+    if not sys.platform.startswith("win"):
+        return None
+
+    script = (
+        "foreach ($ns in 'root/LibreHardwareMonitor','root/OpenHardwareMonitor') {"
+        " try { $s = Get-CimInstance -Namespace $ns -ClassName Sensor -EA Stop |"
+        " Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -match 'CPU|Core|Package' };"
+        " if ($s) { ($s | Measure-Object -Property Value -Maximum).Maximum; exit 0 } } catch {} }"
+    )
+
+    def read() -> float | None:
+        try:
+            proc = subprocess.run(  # noqa: S603
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=6,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return None
+        text = proc.stdout.strip().splitlines()
+        if not text:
+            return None
+        try:
+            return float(text[0].strip())
+        except ValueError:
+            return None
+
+    return read if read() is not None else None
+
+
+def _psutil_reader() -> Any:
+    try:
+        import psutil
+    except ImportError:
+        return None
+    if not hasattr(psutil, "sensors_temperatures"):
+        return None
+
+    def read() -> float | None:
+        try:
+            groups = psutil.sensors_temperatures()  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        best: float | None = None
+        for key in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz"):
+            for entry in groups.get(key, []) or []:
+                value = getattr(entry, "current", None)
+                if value and 0 < value < 150 and (best is None or value > best):
+                    best = float(value)
+        return best
+
+    return read if read() is not None else None
+
+
+def _acpi_reader() -> Any:
+    import subprocess
+    import sys
+
+    if not sys.platform.startswith("win"):
+        return None
+
+    script = (
+        "(Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature"
+        " -EA Stop | Measure-Object -Property CurrentTemperature -Maximum).Maximum"
+    )
+
+    def read() -> float | None:
+        try:
+            proc = subprocess.run(  # noqa: S603
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=6,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return None
+        raw = proc.stdout.strip()
+        if not raw:
+            return None
+        try:
+            # reported in tenths of a Kelvin
+            return float(raw) / 10.0 - 273.15
+        except ValueError:
+            return None
+
+    return read if read() is not None else None
+
+
 LOOPBACK_HINTS = (
     "loopback",
     "stereo mix",

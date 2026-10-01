@@ -14,8 +14,24 @@ except ModuleNotFoundError:  # pragma: no cover
 
 CONFIG_FILENAME = "config.toml"
 
-#: Root folder of the project (the folder that contains the ``pyrgb`` package).
-ROOT_DIR = Path(__file__).resolve().parent.parent
+def _root_dir() -> Path:
+    """Folder that holds ``config.toml``.
+
+    From source this is the project root (the folder containing the ``pyrgb``
+    package).  In a PyInstaller build ``__file__`` points inside the temporary
+    ``_MEIxxxx`` extraction folder, so use the folder of the executable instead
+    - that is where the shipped ``config.toml`` sits and where the user expects
+    to edit it.
+    """
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+#: Root folder that contains the local config file.
+ROOT_DIR = _root_dir()
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "general": {
@@ -56,9 +72,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "breathing": {"color": "#00aaff", "speed": 0.5, "min_brightness": 0.05},
         "rainbow": {"speed": 0.2, "spread": 1.0, "saturation": 1.0},
         "cpu": {
+            "source": "temp",        # temp = CPU temperature, load = CPU usage
             "cold": "#00ff66",
             "warm": "#ffcc00",
             "hot": "#ff1000",
+            "min_temp": 35.0,        # at or below this -> cold colour
+            "mid_temp": 60.0,        # -> warm colour
+            "max_temp": 85.0,        # at or above this -> hot colour
             "smoothing": 0.25,
             "pulse": False,
         },

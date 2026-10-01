@@ -7,6 +7,7 @@ It can live in the taskbar tray when ``[gui] tray = true``.
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Any
 
@@ -19,6 +20,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -28,10 +30,12 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QStatusBar,
     QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +45,14 @@ from .color import BLACK, RGB
 from .config import config_path, load_config
 from .controller import Controller, LocalController, RemoteController, make_controller
 from .effects import REGISTRY, create_effect, effect_names
+
+
+log = logging.getLogger(__name__)
+
+#: readable secondary text on the dark palette (palette(mid) is far too dim)
+HINT_STYLE = "color: #a8b0bd;"
+#: live sensor readout - brighter still, it changes every frame
+READOUT_STYLE = "color: #6fd3ff; font-weight: 600;"
 
 
 def make_color_icon(color: RGB, size: int = 32) -> QIcon:
@@ -102,7 +114,7 @@ class MainWindow(QMainWindow):
         self.cfg = cfg
         self.backend_name = backend_name
         self.setWindowTitle("py_rgb")
-        self.resize(580, 680)
+        self.resize(560, 640)
 
         self.controller: Controller = make_controller(cfg, backend_name)
         self._option_widgets: dict[str, QWidget] = {}
@@ -110,6 +122,7 @@ class MainWindow(QMainWindow):
         self._last_color = BLACK
 
         self._build_ui()
+        self.tray: QSystemTrayIcon | None = None
         self._build_tray()
         self._load_from_state()
 
@@ -128,26 +141,58 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         root = QVBoxLayout(central)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        root.addWidget(self._build_header())
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_effect_tab(), "Effect")
+        self.tabs.addTab(self._build_devices_tab(), "Devices")
+        self.tabs.addTab(self._build_settings_tab(), "Settings")
+        root.addWidget(self.tabs, 1)
+
+        root.addLayout(self._build_action_bar())
+
+        self.setCentralWidget(central)
+        self.setStatusBar(QStatusBar())
+        self._populate_devices()
+
+    # -- header: always-visible preview + mode -------------------------
+    def _build_header(self) -> QWidget:
+        header = QFrame()
+        header.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QVBoxLayout(header)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+
+        top = QHBoxLayout()
+        self.preview = ColorSwatch("#000000", clickable=False)
+        self.preview.setMinimumHeight(34)
+        self.preview.setMinimumWidth(120)
+        self.preview_label = QLabel("#000000")
+        self.preview_label.setStyleSheet(READOUT_STYLE)
+        self.live_label = QLabel("")
+        self.live_label.setStyleSheet(READOUT_STYLE)
+        self.live_label.setMinimumWidth(1)
+        top.addWidget(self.preview, 1)
+        top.addWidget(self.preview_label)
+        layout.addLayout(top)
+        layout.addWidget(self.live_label)
 
         self.mode_label = QLabel()
-        self.mode_label.setWordWrap(True)
-        self.mode_label.setStyleSheet("color: palette(mid);")
-        root.addWidget(self.mode_label)
+        self.mode_label.setStyleSheet(HINT_STYLE)
+        self.mode_label.setMinimumWidth(1)
+        layout.addWidget(self.mode_label)
+        return header
 
-        preview_box = QGroupBox("Live preview")
-        pl = QHBoxLayout(preview_box)
-        self.preview = ColorSwatch("#000000", clickable=False)
-        self.preview.setMinimumHeight(52)
-        self.preview_label = QLabel("#000000")
-        self.preview_label.setMinimumWidth(80)
-        pl.addWidget(self.preview, 1)
-        pl.addWidget(self.preview_label)
-        root.addWidget(preview_box)
+    # -- tab 1: effect --------------------------------------------------
+    def _build_effect_tab(self) -> QWidget:
+        page = QWidget()
+        ev = QVBoxLayout(page)
+        ev.setContentsMargins(12, 12, 12, 12)
+        ev.setSpacing(8)
 
-        effect_box = QGroupBox("Effect")
-        ev = QVBoxLayout(effect_box)
         row = QHBoxLayout()
         self.effect_combo = QComboBox()
         for name in effect_names():
@@ -159,16 +204,26 @@ class MainWindow(QMainWindow):
 
         self.effect_help = QLabel("")
         self.effect_help.setWordWrap(True)
-        self.effect_help.setStyleSheet("color: palette(mid);")
+        self.effect_help.setStyleSheet(HINT_STYLE)
+        self.effect_help.setMinimumWidth(1)
         ev.addWidget(self.effect_help)
 
+        options_box = QGroupBox("Options")
+        ob = QVBoxLayout(options_box)
+        ob.setContentsMargins(10, 8, 10, 8)
         self.options_widget = QWidget()
         self.options_form = QFormLayout(self.options_widget)
-        self.options_form.setContentsMargins(0, 6, 0, 0)
-        ev.addWidget(self.options_widget)
-        root.addWidget(effect_box)
+        self.options_form.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumHeight(230)
+        scroll.setWidget(self.options_widget)
+        ob.addWidget(scroll)
+        ev.addWidget(options_box, 1)
 
-        global_box = QGroupBox("Global")
+        global_box = QGroupBox("Output")
         gf = QFormLayout(global_box)
         self.brightness = QSlider(Qt.Orientation.Horizontal)
         self.brightness.setRange(0, 100)
@@ -187,7 +242,43 @@ class MainWindow(QMainWindow):
         self.fps_spin.setValue(30)
         self.fps_spin.valueChanged.connect(self._on_fps)
         gf.addRow("Frame rate", self.fps_spin)
-        root.addWidget(global_box)
+        ev.addWidget(global_box)
+        return page
+
+    # -- tab 2: devices -------------------------------------------------
+    def _build_devices_tab(self) -> QWidget:
+        page = QWidget()
+        dv = QVBoxLayout(page)
+        dv.setContentsMargins(12, 12, 12, 12)
+        dv.setSpacing(8)
+
+        hint = QLabel("Tick the devices the effect should drive.")
+        hint.setStyleSheet(HINT_STYLE)
+        dv.addWidget(hint)
+
+        self.device_list = QListWidget()
+        self.device_list.setMinimumWidth(1)
+        self.device_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.device_list.itemChanged.connect(self._on_devices_changed)
+        dv.addWidget(self.device_list, 1)
+
+        self.backend_label = QLabel("")
+        self.backend_label.setWordWrap(True)
+        self.backend_label.setStyleSheet(HINT_STYLE)
+        self.backend_label.setMinimumWidth(1)
+        dv.addWidget(self.backend_label)
+
+        refresh = QPushButton("Rescan devices")
+        refresh.clicked.connect(self._populate_devices)
+        dv.addWidget(refresh, 0, Qt.AlignmentFlag.AlignLeft)
+        return page
+
+    # -- tab 3: settings ------------------------------------------------
+    def _build_settings_tab(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
 
         startup_box = QGroupBox("Startup")
         sf = QFormLayout(startup_box)
@@ -198,6 +289,16 @@ class MainWindow(QMainWindow):
         )
         self.autostart_check.toggled.connect(self._on_autostart_toggled)
         sf.addRow(self.autostart_check)
+
+        self.autostart_mode = QComboBox()
+        self.autostart_mode.addItem("Daemon + tray icon", True)
+        self.autostart_mode.addItem("Daemon only (no tray)", False)
+        self.autostart_mode.setToolTip(
+            "The daemon drives the LEDs with no window.\n"
+            "Adding the tray icon also gives you quick controls in the taskbar."
+        )
+        self.autostart_mode.currentIndexChanged.connect(self._on_autostart_mode_changed)
+        sf.addRow("Launch at logon", self.autostart_mode)
 
         self.tray_check = QCheckBox("Minimise to tray instead of quitting")
         self.tray_check.toggled.connect(
@@ -215,18 +316,35 @@ class MainWindow(QMainWindow):
 
         self.autostart_hint = QLabel("")
         self.autostart_hint.setWordWrap(True)
-        self.autostart_hint.setStyleSheet("color: palette(mid);")
+        self.autostart_hint.setStyleSheet(HINT_STYLE)
+        self.autostart_hint.setMinimumWidth(1)
         sf.addRow(self.autostart_hint)
-        root.addWidget(startup_box)
+        outer.addWidget(startup_box)
 
-        device_box = QGroupBox("Devices")
-        dv = QVBoxLayout(device_box)
-        self.device_list = QListWidget()
-        self.device_list.setMaximumHeight(110)
-        self.device_list.itemChanged.connect(self._on_devices_changed)
-        dv.addWidget(self.device_list)
-        root.addWidget(device_box)
+        config_box = QGroupBox("Configuration file")
+        cf = QVBoxLayout(config_box)
+        self.config_label = QLabel(str(config_path()))
+        self.config_label.setWordWrap(True)
+        self.config_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.config_label.setStyleSheet(HINT_STYLE)
+        self.config_label.setMinimumWidth(1)
+        cf.addWidget(self.config_label)
 
+        crow = QHBoxLayout()
+        open_btn = QPushButton("Open folder")
+        open_btn.clicked.connect(self._open_config_folder)
+        crow.addWidget(open_btn)
+        crow.addStretch(1)
+        cf.addLayout(crow)
+        outer.addWidget(config_box)
+
+        outer.addStretch(1)
+        return page
+
+    # -- persistent action bar ------------------------------------------
+    def _build_action_bar(self) -> QHBoxLayout:
         buttons = QHBoxLayout()
         self.start_btn = QPushButton("Start")
         self.start_btn.clicked.connect(self._toggle)
@@ -238,17 +356,28 @@ class MainWindow(QMainWindow):
         self.reload_btn.clicked.connect(self._reload_config)
         for b in (self.start_btn, self.off_btn, self.save_btn, self.reload_btn):
             buttons.addWidget(b)
-        root.addLayout(buttons)
+        return buttons
 
-        self.setCentralWidget(central)
-        self.setStatusBar(QStatusBar())
-        self._populate_devices()
+    def _open_config_folder(self) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
 
-    def _build_tray(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(config_path().parent)))
+
+    def _build_tray(self) -> bool:
+        """Create the tray icon. Returns False when the tray is not (yet) there.
+
+        At logon Explorer often has not created the notification area yet, so the
+        caller retries for a while instead of silently giving up.
+        """
         gui_cfg = self.cfg.get("gui", {})
+        if getattr(self, "tray", None) is not None:
+            return True
         self.tray: QSystemTrayIcon | None = None
-        if not gui_cfg.get("tray", True) or not QSystemTrayIcon.isSystemTrayAvailable():
-            return
+        if not gui_cfg.get("tray", True):
+            return True  # tray disabled on purpose - nothing to wait for
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return False
 
         self.tray = QSystemTrayIcon(make_color_icon(BLACK), self)
         self.tray.setToolTip("py_rgb")
@@ -281,6 +410,32 @@ class MainWindow(QMainWindow):
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
+        self._apply_preview(self._last_color)
+        log.info("tray icon created")
+        return True
+
+    def start_tray_retry(self, attempts: int = 30, interval_ms: int = 2000) -> None:
+        """Keep trying to create the tray icon (logon race), then give up visibly."""
+        if self._build_tray():
+            return
+        self._tray_attempts = attempts
+        self._tray_timer = QTimer(self)
+
+        def attempt() -> None:
+            self._tray_attempts -= 1
+            if self._build_tray():
+                self._tray_timer.stop()
+                log.info("tray icon appeared after the notification area was ready")
+                return
+            if self._tray_attempts <= 0:
+                self._tray_timer.stop()
+                log.warning("system tray never became available; showing the window instead")
+                self.show()
+                self.raise_()
+
+        self._tray_timer.timeout.connect(attempt)
+        self._tray_timer.start(interval_ms)
+        log.info("system tray not ready yet; retrying for %.0fs", attempts * interval_ms / 1000)
 
     # ------------------------------------------------------------------
     # state sync
@@ -303,6 +458,11 @@ class MainWindow(QMainWindow):
             self.device_list.addItem(item)
         if not devices:
             self.device_list.addItem("no devices detected")
+        if hasattr(self, "backend_label"):
+            self.backend_label.setText(
+                f"Backend: {self.controller.backend_name}  -  "
+                f"{len(devices)} device(s) detected"
+            )
         self._updating = False
 
     def _load_from_state(self) -> None:
@@ -324,14 +484,14 @@ class MainWindow(QMainWindow):
 
     def _update_mode_label(self) -> None:
         if isinstance(self.controller, RemoteController):
-            self.mode_label.setText(
-                "Connected to the py_rgb daemon - changes are sent to the service and "
-                "saved to config.toml."
+            self.mode_label.setText("Mode: connected to the py_rgb daemon")
+            self.mode_label.setToolTip(
+                "The background daemon owns the LEDs.\n"
+                "Changes are sent to it and saved to config.toml."
             )
         else:
-            self.mode_label.setText(
-                "Running locally (no daemon detected) - this window owns the hardware."
-            )
+            self.mode_label.setText("Mode: running locally (no daemon)")
+            self.mode_label.setToolTip("This window owns the hardware directly.")
 
     def _rebuild_options(self, params: dict[str, Any] | None = None) -> None:
         while self.options_form.rowCount():
@@ -346,8 +506,17 @@ class MainWindow(QMainWindow):
         self._updating = True
         for key, (kind, default, lo, hi) in cls.options.items():
             value = params.get(key, default)
-            if kind == "color":
-                w: QWidget = ColorSwatch(str(value))
+            if kind == "choice":
+                w: QWidget = QComboBox()
+                for choice in lo or []:
+                    w.addItem(str(choice), str(choice))
+                idx = w.findData(str(value))
+                w.setCurrentIndex(idx if idx >= 0 else 0)
+                w.currentIndexChanged.connect(
+                    lambda _i, k=key, combo=w: self._set_param(k, combo.currentData())
+                )
+            elif kind == "color":
+                w = ColorSwatch(str(value))
                 w.changed.connect(lambda hexval, k=key: self._set_param(k, hexval))
             elif kind == "bool":
                 w = QCheckBox()
@@ -371,10 +540,13 @@ class MainWindow(QMainWindow):
             self.options_form.addRow(key.replace("_", " ").title(), w)
         self._updating = False
 
-    @staticmethod
-    def _source_hint(name: str) -> str:
+    def _source_hint(self, name: str) -> str:
         if name == "cpu":
-            return "  (live CPU load via psutil)"
+            status = self.controller.status()
+            provider = status.get("temp_provider", "none")
+            if status.get("temp_available"):
+                return f"  (temperature via {provider}; 'load' uses psutil CPU usage)"
+            return "  (no temperature sensor - run MSI Afterburner, or use source = load)"
         if name == "audio":
             return "  (captures speaker output; not available to a session-0 service)"
         return ""
@@ -434,9 +606,13 @@ class MainWindow(QMainWindow):
         try:
             installed = svc.startup_installed()
             self.autostart_check.setChecked(installed)
-            self.autostart_hint.setText(
-                f"Runs: {' '.join(svc.daemon_command())}" if installed else "Not registered."
-            )
+            if installed:
+                with_tray = svc.startup_has_tray()
+                self.autostart_mode.setCurrentIndex(0 if with_tray else 1)
+                self.autostart_hint.setText(f"Runs: {svc.startup_entry()}")
+            else:
+                self.autostart_hint.setText("Not registered - py_rgb will not start with Windows.")
+            self.autostart_mode.setEnabled(installed)
         finally:
             self._updating = was
 
@@ -445,9 +621,30 @@ class MainWindow(QMainWindow):
             return
         from . import service as svc
 
-        ok, message = svc.startup_install() if checked else svc.startup_uninstall()
+        if checked:
+            ok, message = svc.startup_install(with_tray=self._autostart_wants_tray())
+        else:
+            ok, message = svc.startup_uninstall()
         if not ok:
             QMessageBox.warning(self, "py_rgb", f"Could not change the startup entry:\n{message}")
+        else:
+            self.statusBar().showMessage(message, 5000)
+        self._sync_autostart_checkbox()
+
+    def _autostart_wants_tray(self) -> bool:
+        data = self.autostart_mode.currentData()
+        return True if data is None else bool(data)
+
+    def _on_autostart_mode_changed(self) -> None:
+        if self._updating:
+            return
+        from . import service as svc
+
+        if not svc.startup_installed():
+            return
+        ok, message = svc.startup_install(with_tray=self._autostart_wants_tray())
+        if not ok:
+            QMessageBox.warning(self, "py_rgb", f"Could not update the startup entry:\n{message}")
         else:
             self.statusBar().showMessage(message, 5000)
         self._sync_autostart_checkbox()
@@ -523,11 +720,15 @@ class MainWindow(QMainWindow):
         if self.tray is not None:
             self.act_toggle.setText("Pause" if running else "Start")
 
+        self._update_live_readout(status)
+
         parts = [f"backend: {self.controller.backend_name}"]
         parts.append(f"{status.get('fps', 0)} fps" if running else "stopped")
         effect = status.get("effect")
         if effect == "cpu":
             parts.append(f"cpu: {float(status.get('cpu', 0.0)) * 100:.0f}%")
+            if status.get("temp_available"):
+                parts.append(f"{float(status.get('temp', 0.0)):.0f}\u00b0C")
         elif effect == "audio":
             mode = status.get("audio_mode", "none")
             if mode and mode != "none":
@@ -539,6 +740,30 @@ class MainWindow(QMainWindow):
         if isinstance(self.controller, RemoteController) and not self.controller.connected:
             parts = ["daemon connection lost - restart it or reopen this window"]
         self.statusBar().showMessage("   |   ".join(parts))
+
+    def _update_live_readout(self, status: dict[str, Any]) -> None:
+        """Show the live signal the current effect reacts to."""
+        effect = status.get("effect")
+        if effect == "cpu":
+            load = float(status.get("cpu", 0.0)) * 100.0
+            if status.get("temp_available"):
+                temp = float(status.get("temp", 0.0))
+                self.live_label.setText(f"CPU {temp:.0f}\u00b0C  \u00b7  load {load:.0f}%")
+                self.live_label.setToolTip(f"temperature via {status.get('temp_provider', '')}")
+            else:
+                self.live_label.setText(f"CPU load {load:.0f}%  \u00b7  no temp sensor")
+                self.live_label.setToolTip("")
+        elif effect == "audio":
+            level = float(status.get("audio", 0.0)) * 100.0
+            mode = status.get("audio_mode", "none")
+            if mode and mode != "none":
+                self.live_label.setText(f"Audio {level:.0f}%")
+                self.live_label.setToolTip(str(mode))
+            else:
+                self.live_label.setText("Audio capture unavailable")
+                self.live_label.setToolTip("")
+        else:
+            self.live_label.setText("")
 
     def _apply_preview(self, color: RGB) -> None:
         self._last_color = color
@@ -581,16 +806,27 @@ def run_gui(cfg: dict[str, Any], backend_name: str | None = None) -> int:
     _apply_dark_palette(app)
 
     gui_cfg = cfg.get("gui", {})
-    tray_wanted = gui_cfg.get("tray", True) and QSystemTrayIcon.isSystemTrayAvailable()
+    tray_wanted = bool(gui_cfg.get("tray", True))
+    start_minimized = bool(gui_cfg.get("start_minimized", False))
+    # Never quit on last window close while we still expect a tray icon,
+    # otherwise a minimised start would exit immediately.
     app.setQuitOnLastWindowClosed(not tray_wanted)
 
     try:
         window = MainWindow(cfg, backend_name)
     except BackendError as exc:
+        log.exception("could not start the GUI")
         QMessageBox.critical(None, "py_rgb", str(exc))
         return 2
+    except Exception as exc:  # noqa: BLE001 - windowed build has no console
+        log.exception("unexpected GUI failure")
+        QMessageBox.critical(None, "py_rgb", f"py_rgb failed to start:\n{exc}")
+        return 2
 
-    if gui_cfg.get("start_minimized", False) and tray_wanted:
+    if tray_wanted:
+        window.start_tray_retry()
+
+    if start_minimized and tray_wanted:
         window.hide()
     else:
         window.show()

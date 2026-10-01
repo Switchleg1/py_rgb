@@ -1,0 +1,3 @@
+2026-09-30 17:54:27,247 INFO pyrgb: tray startup: config=C:\Users\switchleg\Documents\GitHub\py_rgb\config.toml frozen=False
+2026-09-30 17:54:39,596 INFO pyrgb: daemon: daemon started
+2026-09-30 17:54:39,744 INFO pyrgb.gui: system tray not ready yet; retrying for 60s

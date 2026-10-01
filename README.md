@@ -160,9 +160,13 @@ speed = 0.5
 min_brightness = 0.05
 
 [effects.cpu]
-cold = "#00ff66"
-warm = "#ffcc00"
-hot = "#ff1000"
+source = "temp"     # temp = CPU temperature, load = CPU usage
+cold = "#00ff66"    # at/below min_temp
+warm = "#ffcc00"    # at mid_temp
+hot = "#ff1000"     # at/above max_temp
+min_temp = 35.0
+mid_temp = 60.0
+max_temp = 85.0
 smoothing = 0.25
 pulse = false
 
@@ -188,7 +192,7 @@ Any missing key falls back to the built-in defaults, so a partial config is fine
 | `static` | solid colour | `color` |
 | `breathing` | smooth sine fade | `color`, `speed`, `min_brightness` |
 | `rainbow` | hue cycle / wave across LEDs | `speed`, `spread`, `saturation` |
-| `cpu` | colour + bar follow CPU load (cold→warm→hot) | `cold`, `warm`, `hot`, `smoothing`, `pulse` |
+| `cpu` | colour + bar follow CPU **temperature** or load | `source`, `cold`, `warm`, `hot`, `min_temp`, `mid_temp`, `max_temp`, `smoothing`, `pulse` |
 | `audio` | reacts to sound coming out of your speakers | `color`, `peak_color`, `gain`, `smoothing`, `floor` |
 | `strobe` | hard on/off flashing | `color`, `speed`, `duty` |
 | `random` | random colour fades | `speed`, `per_led` |
@@ -196,6 +200,24 @@ Any missing key falls back to the built-in defaults, so a partial config is fine
 
 On multi-LED devices, `cpu` and `audio` render as a bar graph; `rainbow` renders
 a travelling wave.
+
+### CPU temperature
+
+`effects.cpu.source = "temp"` colours the LEDs by CPU temperature, interpolating
+`cold -> warm -> hot` across `min_temp / mid_temp / max_temp`. The GUI shows the
+live reading under the effect picker and in the status bar.
+
+Windows gives unprivileged processes no CPU temperature API, so py_rgb tries, in
+order:
+
+1. **MSI Afterburner** shared memory (`MAHMSharedMemory`) - no admin, just leave
+   Afterburner running
+2. **LibreHardwareMonitor / OpenHardwareMonitor** WMI sensors
+3. `psutil.sensors_temperatures()` (Linux and friends)
+4. ACPI `MSAcpi_ThermalZoneTemperature` (usually needs admin, chipset only)
+
+`pyrgb doctor` reports which one is in use. With no sensor available the effect
+transparently falls back to CPU load, and `source = "load"` forces that.
 
 ## Audio capture
 
@@ -214,6 +236,56 @@ The `audio` effect listens to your **output**, trying in order:
 `pyrgb` (or `pyrgb gui`) opens a dark Qt6 window with a live colour preview,
 effect picker with auto-generated option controls (colour pickers, sliders,
 toggles), brightness/FPS, per-device checkboxes, and save/reload of `config.toml`.
+
+## Building standalone executables
+
+```cmd
+build.bat              :: build dist\py_rgb\{pyrgb.exe, pyrgbw.exe, config.toml}
+build.bat test         :: run the test suite first, then build
+build.bat onedir       :: folder build instead of single-file
+build.bat deps         :: install/refresh build + runtime dependencies
+build.bat clean        :: remove build/, dist/, *.spec, __pycache__
+```
+
+| Binary | Console | Use |
+|---|---|---|
+| `pyrgb.exe` | yes | CLI: `devices`, `doctor`, `run`, `ctl`, `service`, `config` |
+| `pyrgbw.exe` | no | double-click for the GUI; also runs the daemon with no console flash |
+
+The frozen build reads `config.toml` **next to the executable** (not from
+PyInstaller's temp folder), and the autostart entry automatically points at
+`pyrgbw.exe daemon` so nothing pops up a console window at logon.
+
+## Start with Windows (opt-in)
+
+Autostart is **off by default**. Enable it from the GUI under
+**Startup -> "Start py_rgb with Windows"**, which adds/removes
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\py_rgb` - no administrator
+rights, and the checkbox always reflects the real registry state.
+
+The **Launch at logon** dropdown next to it picks what actually starts:
+
+| Choice | Registry command | Result |
+|---|---|---|
+| **Daemon + tray icon** *(default)* | `pyrgbw.exe tray` | LEDs run **and** the tray icon appears |
+| Daemon only (no tray) | `pyrgbw.exe daemon` | LEDs run headless, nothing in the taskbar |
+
+`pyrgb tray` starts the daemon if it is not already running, waits for its
+control channel, then attaches as a client and drops straight into the tray -
+so one logon entry gives you both halves. If the system tray is unavailable it
+shows the window instead of silently doing nothing.
+
+Same from the CLI:
+
+```bash
+pyrgb service install --tray   # logon entry: daemon + tray icon
+pyrgb service install          # logon entry: daemon only
+pyrgb service uninstall        # remove it
+pyrgb service status           # shows the exact registered command
+
+pyrgb tray                     # start daemon + tray right now
+pyrgb gui --minimized          # GUI straight to the tray
+```
 
 ## Daemon / service
 

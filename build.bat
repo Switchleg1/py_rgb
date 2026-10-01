@@ -51,9 +51,21 @@ if "%RUNTESTS%"=="1" (
     %PY% tests\test_pyrgb.py || (echo [ERROR] tests failed & exit /b 1)
 )
 
+REM --- a running daemon/GUI locks the .exe files -----------------------
+echo [*] Stopping any running py_rgb instances...
+if exist "%DIST%\pyrgb.exe" "%DIST%\pyrgb.exe" ctl stop >nul 2>&1
+%PY% -m pyrgb ctl stop >nul 2>&1
+taskkill /f /im pyrgbw.exe >nul 2>&1
+taskkill /f /im pyrgb.exe >nul 2>&1
+ping -n 2 127.0.0.1 >nul 2>&1
+
 echo [*] Cleaning previous output...
 if exist build rmdir /s /q build
 if exist "%DIST%" rmdir /s /q "%DIST%"
+if exist "%DIST%" (
+    echo [ERROR] Cannot clean %DIST% - a py_rgb process is still using it.
+    exit /b 1
+)
 
 REM --- shared PyInstaller options ------------------------------------
 REM hidden imports: optional backends/sources PyInstaller cannot see

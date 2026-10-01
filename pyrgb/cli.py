@@ -53,7 +53,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command")
 
-    sub.add_parser("gui", parents=[common], help="launch the Qt6 interface (default when run bare)")
+    sp = sub.add_parser(
+        "gui", parents=[common], help="launch the Qt6 interface (default when run bare)"
+    )
+    sp.add_argument("--minimized", action="store_true", help="start hidden in the tray")
+
+    sp = sub.add_parser(
+        "tray",
+        parents=[common],
+        help="start the daemon (if needed) and sit in the tray - used by autostart",
+    )
+    sp.add_argument(
+        "--no-daemon", action="store_true", help="do not start a daemon, run the engine in-process"
+    )
+    sp.add_argument(
+        "--window", action="store_true", help="also show the window instead of only the tray icon"
+    )
 
     sub.add_parser("devices", parents=[common], help="list detected RGB devices")
     sub.add_parser("doctor", parents=[common], help="diagnose why hardware is not detected")
@@ -102,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
         "task = Scheduled Task (needs admin); "
         "service = real Windows service (admin, session 0, no audio)",
     )
+    sp.add_argument(
+        "--tray",
+        action="store_true",
+        help="start the tray icon together with the daemon (startup mode only)",
+    )
 
     sp = sub.add_parser("ctl", parents=[common], help="send a command to a running daemon")
     sp.add_argument(
@@ -146,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "gui":
             return cmd_gui(args, cfg)
+        if command == "tray":
+            return cmd_tray(args, cfg, path)
         if command == "devices":
             return cmd_devices(args, cfg)
         if command == "doctor":
@@ -185,9 +207,67 @@ def cmd_gui(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
     try:
         from .gui import run_gui
     except ImportError as exc:
-        print(f"error: Qt6 GUI unavailable ({exc}); install PyQt6 or use 'pyrgb run'", file=sys.stderr)
+        print(
+            f"error: Qt6 GUI unavailable ({exc}); install PyQt6 or use 'pyrgb run'",
+            file=sys.stderr,
+        )
         return 2
+    if getattr(args, "minimized", False):
+        cfg.setdefault("gui", {})["start_minimized"] = True
     return run_gui(cfg, backend_name=args.backend)
+
+
+def cmd_tray(args: argparse.Namespace, cfg: dict[str, Any], path: Any) -> int:
+    """Autostart entry point: ensure a daemon is up, then show the tray icon."""
+    from . import service as svc
+
+    try:
+        from .gui import run_gui
+    except ImportError as exc:
+        print(f"error: Qt6 GUI unavailable ({exc})", file=sys.stderr)
+        return 2
+
+    # windowed builds have no console: always leave a trace on disk
+    target_cfg = path or config_path()
+    _add_file_log(target_cfg.parent / "pyrgb-tray.log")
+    log.info("tray startup: config=%s frozen=%s", target_cfg, getattr(sys, "frozen", False))
+
+    gui_cfg = cfg.setdefault("gui", {})
+    gui_cfg["tray"] = True
+    gui_cfg.setdefault("close_to_tray", True)
+    if not args.window:
+        gui_cfg["start_minimized"] = True
+
+    if not args.no_daemon:
+        daemon_cfg = cfg.get("daemon", {})
+        ok, message = svc.daemon_spawn(
+            path or config_path(),
+            wait=15.0,
+            host=daemon_cfg.get("host", "127.0.0.1"),
+            port=int(daemon_cfg.get("port", 6743)),
+        )
+        log.info("daemon: %s", message)
+        if not ok:
+            # fall through anyway: the GUI will drive the hardware locally
+            log.warning("continuing without a daemon (%s)", message)
+
+    try:
+        return run_gui(cfg, backend_name=args.backend)
+    except Exception:
+        log.exception("tray mode crashed")
+        raise
+
+
+def _add_file_log(path: Any) -> None:
+    try:
+        handler = logging.FileHandler(str(path), encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    if root.level > logging.INFO:
+        root.setLevel(logging.INFO)
 
 
 def cmd_devices(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
@@ -275,9 +355,22 @@ def cmd_doctor(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
     try:
         import psutil  # noqa: F401
 
-        print("  ok psutil (cpu effect)")
+        print("  ok psutil (cpu load)")
     except ImportError:
         print("  x  psutil missing -> pip install psutil")
+
+    from .sources import CPUTempSource
+
+    temp = CPUTempSource()
+    temp.start()
+    if temp.available:
+        print(f"  ok cpu temperature: {temp.value:.0f}\u00b0C via {temp.provider}")
+    else:
+        print(
+            "  !  no cpu temperature source (run MSI Afterburner or "
+            "LibreHardwareMonitor, or use effects.cpu.source = load)"
+        )
+    temp.stop()
     from .sources import AudioSource
 
     audio = AudioSource()
@@ -434,9 +527,10 @@ def cmd_service(args: argparse.Namespace, cfg: dict[str, Any], path: Any) -> int
     from . import service as svc
 
     target = path or config_path()
+    with_tray = bool(getattr(args, "tray", False))
     if args.mode == "startup":
         actions = {
-            "install": lambda: svc.startup_install(target),
+            "install": lambda: svc.startup_install(target, with_tray),
             "uninstall": lambda: svc.startup_uninstall(),
             "start": lambda: svc.daemon_spawn(target),
             "stop": lambda: svc.daemon_kill(),
@@ -469,7 +563,12 @@ def cmd_service(args: argparse.Namespace, cfg: dict[str, Any], path: Any) -> int
         )
     print(out.strip() or ("ok" if ok else "failed"))
     if args.action == "install" and ok:
-        print(f"daemon command: {' '.join(svc.daemon_command(target))}")
+        launch = (
+            svc.startup_command(target, with_tray)
+            if args.mode == "startup"
+            else svc.daemon_command(target)
+        )
+        print(f"launches: {' '.join(launch)}")
         if args.mode == "service":
             print("note: a session-0 service cannot capture audio; use --mode task for that")
     return 0 if ok else 1
@@ -487,8 +586,11 @@ def _startup_status(svc: Any, cfg: dict[str, Any]) -> tuple[bool, str]:
     )
     lines = [
         f"logon entry : {'installed' if installed else 'not installed'}",
-        f"daemon      : {'running' if status else 'not running'}",
     ]
+    if installed:
+        lines.append(f"              {'daemon + tray' if svc.startup_has_tray() else 'daemon only'}")
+        lines.append(f"              {svc.startup_entry()}")
+    lines.append(f"daemon      : {'running' if status else 'not running'}")
     if status:
         lines.append(
             f"              backend={status.get('backend')} effect={status.get('effect')} "
